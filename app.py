@@ -9,6 +9,7 @@ from visualization import (
     plot_correlation_heatmap,
     plot_histogram,
     plot_line_chart,
+    plot_scatter_chart,
     show_dataset_preview,
 )
 
@@ -241,30 +242,63 @@ def _suggest_columns_from_text(text, df, limit=5):
     return direct[:limit]
 
 
-def _render_auto_result_chart(question, df):
+def _render_auto_result_chart(question, df, rendered_df=None):
     """
-    Auto-generate chart after result:
+    Auto-generate chart based on structural return payload:
     - comparison query -> bar chart
-    - numeric column query -> histogram
+    - categorical + numeric -> bar chart
+    - 1 numeric -> histogram
+    - 2 numeric -> scatter
+    - 3+ numeric -> heatmap
     """
-    columns = list(df.columns)
-    numeric_cols = _meaningful_numeric_columns(df)
-    if not columns or not numeric_cols:
+    target_df = rendered_df if rendered_df is not None and not rendered_df.empty else df
+    target_cols = list(target_df.columns)
+    
+    numeric_cols = [c for c in target_cols if pd.api.types.is_numeric_dtype(target_df[c]) and not _is_id_like_column(c)]
+    cat_cols = [c for c in target_cols if c not in numeric_cols and not _is_id_like_column(c)]
+    
+    if not numeric_cols:
+        st.warning("No numeric data available for visualization")
         return
 
-    if _is_comparison_query(question):
-        x_col = _best_x_column_for_comparison(df, question=question)
-        y_col = _best_numeric_column_for_chart(df, question=question) or _select_default_column(numeric_cols, "value")
-        fig = plot_bar_chart(df, x_col, y_col)
+    text = (question or "").lower()
+    
+    if "compare" in text or "comparison" in text or " vs " in text:
+        y_col = numeric_cols[0]
+        x_col = cat_cols[0] if cat_cols else (numeric_cols[1] if len(numeric_cols)>1 else target_cols[0])
+        fig = plot_bar_chart(target_df, x_col, y_col)
         st.pyplot(fig)
-        st.caption(f"Auto chart: bar chart (X={x_col}, Y={y_col})")
+        st.caption(f"Comparison chart: {y_col} across {x_col}")
+        return
+        
+    if len(cat_cols) > 0 and len(numeric_cols) > 0:
+        x_col = cat_cols[0]
+        y_col = numeric_cols[0]
+        fig = plot_bar_chart(target_df, x_col, y_col)
+        st.pyplot(fig)
+        st.caption(f"Auto chart: {y_col} across {x_col}")
         return
 
-    # Default for numeric analysis questions: histogram
-    hist_col = _best_numeric_column_for_chart(df, question=question) or numeric_cols[0]
-    fig = plot_histogram(df, hist_col)
-    st.pyplot(fig)
-    st.caption(f"Auto chart: histogram of {hist_col}")
+    if len(numeric_cols) == 1:
+        hist_col = numeric_cols[0]
+        fig = plot_histogram(target_df, hist_col)
+        st.pyplot(fig)
+        st.caption(f"Auto chart: Histogram of {hist_col}")
+        return
+        
+    if len(numeric_cols) == 2:
+        x_col = numeric_cols[0]
+        y_col = numeric_cols[1]
+        fig = plot_scatter_chart(target_df, x_col, y_col)
+        st.pyplot(fig)
+        st.caption(f"Auto chart: Scatter plot of {y_col} vs {x_col}")
+        return
+        
+    if len(numeric_cols) >= 3:
+        fig = plot_correlation_heatmap(target_df)
+        st.pyplot(fig)
+        st.caption(f"Auto chart: Correlation Heatmap across {len(numeric_cols)} features")
+        return
 
 
 def _render_chart_from_question(question, df):
@@ -722,7 +756,7 @@ if uploaded_file is not None:
                 if _wants_chart(user_question):
                     _render_chart_from_question(user_question, df)
                 else:
-                    _render_auto_result_chart(user_question, df)
+                    _render_auto_result_chart(user_question, df, rendered_df=rendered_df)
             except Exception as chart_error:
                 # Try to suggest a likely column if user typed one that doesn't exist
                 suggestions = _suggest_columns_from_text(user_question, df)
