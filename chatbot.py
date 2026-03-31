@@ -533,8 +533,9 @@ def parse_query(raw_query, df):
         "sort": None,
         "limit": None,
         "derived_columns": set(),
-        "wants_names": any(w in query_lower for w in ["who", "which student", "whose", "students", "name", "list"]),
-        "intent": ""
+        "wants_names": any(w in query_lower for w in ["who", "which student", "which", "whose", "students", "name", "list"]),
+        "intent": "",
+        "superlative": None
     }
     
     # 1. Intent Detection
@@ -605,7 +606,25 @@ def parse_query(raw_query, df):
             is_asc = "lowest" in query_lower
             parsed["sort"] = {"column": sort_col, "ascending": is_asc}
             
-    # Remove identical duplicate filters if trapped multiple times
+    # 7. Superlatives (idxmax / idxmin sequencing)
+    sup_match = re.search(r"(most|highest|maximum|best)\s+([a-zA-Z_]+(?:[\s_][a-zA-Z_]+)?)", query_lower)
+    if sup_match:
+        scol = find_col(sup_match.group(2))
+        if scol:
+            parsed["superlative"] = {"column": scol, "operator": "max"}
+            
+    sup_match_low = re.search(r"(least|lowest|minimum|worst)\s+([a-zA-Z_]+(?:[\s_][a-zA-Z_]+)?)", query_lower)
+    if sup_match_low:
+        scol = find_col(sup_match_low.group(2))
+        if scol:
+            parsed["superlative"] = {"column": scol, "operator": "min"}
+            
+    if not parsed["superlative"]:
+        if "studied most" in query_lower or "studied the most" in query_lower:
+            parsed["superlative"] = {"column": "Study_Hours", "operator": "max"}
+        elif "studied least" in query_lower or "studied the least" in query_lower:
+            parsed["superlative"] = {"column": "Study_Hours", "operator": "min"}
+            
     unique_f = []
     seen = set()
     for f in parsed["filters"]:
@@ -666,6 +685,22 @@ def apply_filters(df, parsed):
         result_df = result_df.head(parsed["limit"])
         explanations.append(f"limited to top {parsed['limit']}")
         
+    # 4. Superlative Sequencing (MUST be executed last after filters)
+    if parsed["superlative"] and not result_df.empty:
+        scol = parsed["superlative"]["column"]
+        op = parsed["superlative"]["operator"]
+        
+        if scol in result_df.columns:
+            if op == "max":
+                idx = result_df[scol].idxmax()
+                superlative_desc = f"highest {scol}"
+            else:
+                idx = result_df[scol].idxmin()
+                superlative_desc = f"lowest {scol}"
+                
+            result_df = result_df.loc[[idx]]
+            explanations.append(superlative_desc)
+        
     return result_df, explanations
 
 
@@ -675,7 +710,7 @@ def generate_response(filtered_df, parsed, explanations, df):
     """
     if filtered_df.empty:
         return _format_result_with_explanation(
-            "No matching records found.",
+            "No students match this condition.",
             "Combined conditions: " + " AND ".join(explanations)
         )
         
@@ -690,6 +725,27 @@ def generate_response(filtered_df, parsed, explanations, df):
         if len(non_num) > 0:
             name_col = non_num[0]
             
+    # Output 1: Superlative Single Record Lookups
+    if parsed["superlative"] and len(filtered_df) == 1:
+        scol = parsed["superlative"]["column"]
+        op_str = "highest" if parsed["superlative"]["operator"] == "max" else "lowest"
+        
+        filter_exps = [e for e in explanations if not e.startswith(op_str)]
+        joined_filters = " AND ".join(filter_exps) if filter_exps else "the dataset"
+        
+        res_header = f"**Matching Student:** {filtered_df[name_col].iloc[0]}" if name_col else "**Found 1 matching record.**"
+        exp_text = f"This student has the {op_str} {scol} among those who match: {joined_filters}."
+        
+        cols_to_show = [name_col] if name_col else []
+        if scol not in cols_to_show and scol in df.columns:
+            cols_to_show.append(scol)
+        for f in parsed["filters"]:
+            if f["column"] not in cols_to_show and f["column"] in df.columns:
+                cols_to_show.append(f["column"])
+                
+        return _format_result_with_explanation(res_header, exp_text), filtered_df[cols_to_show]
+            
+    # Output 2: Textual Array for exact Name List extractions
     if parsed["wants_names"] and name_col and not parsed["limit"]:
         names = filtered_df[name_col].astype(str).tolist()
         joined = ", ".join(names)
@@ -729,7 +785,70 @@ def generate_response(filtered_df, parsed, explanations, df):
     return _format_result_with_explanation(header, explanation), filtered_df[cols_to_show]
 
 
+def _generate_insight(df):
+    """Generates a dynamic analytical insight based on dataset correlations and outliers."""
+    numeric_df = df.copy().select_dtypes(include="number")
+    if numeric_df.shape[1] < 2:
+        return ""
+        
+    if "average_marks" not in numeric_df.columns:
+        mark_cols = [c for c in ["Math", "Science", "English"] if c in numeric_df.columns]
+        if mark_cols:
+            numeric_df["average_marks"] = numeric_df[mark_cols].mean(axis=1)
+            
+    if "average_marks" not in numeric_df.columns:
+        return ""
+
+    features = [c for c in numeric_df.columns if c not in ["average_marks", "Math", "Science", "English"] and not _is_id_like_column(c)]
+    
+    insight = ""
+    
+    best_col = None
+    best_corr = 0.0
+    for col in features:
+        if numeric_df[col].nunique() > 1:
+            corr = numeric_df["average_marks"].corr(numeric_df[col])
+            if pd.notna(corr) and abs(corr) > abs(best_corr):
+                best_corr = corr
+                best_col = col
+            
+    if best_col and abs(best_corr) >= 0.3:
+        direction = "higher" if best_corr > 0 else "lower"
+        insight += f"Students with higher **{best_col}** tend to score {direction} overall marks (correlation: {best_corr:.2f}). "
+        
+    study_col = _find_column_from_question("Study", df)
+    if study_col and study_col in numeric_df.columns:
+        sh_mean = numeric_df[study_col].mean()
+        am_mean = numeric_df["average_marks"].mean()
+        outliers = numeric_df[(numeric_df[study_col] > sh_mean) & (numeric_df["average_marks"] < am_mean)]
+        if len(outliers) > 0:
+            insight += f"Note: {len(outliers)} student(s) show high {study_col} but below-average marks (potential outliers)."
+            
+    return insight.strip()
+
+
 def answer_question(user_question, df):
+    """Answers the question and dynamically appends dataset insights."""
+    result = _core_answer_question(user_question, df)
+    
+    if not user_question or not user_question.strip():
+        return result
+        
+    insight = _generate_insight(df)
+    if not insight:
+        return result
+        
+    if isinstance(result, tuple):
+        return result[0] + f"\n\n💡 **Insight**: {insight}", result[1]
+    elif isinstance(result, str):
+        if "I could not detect" in result or "I understand the column" in result:
+            return result
+        return result + f"\n\n💡 **Insight**: {insight}"
+        
+    return result
+
+
+def _core_answer_question(user_question, df):
     """Answer user question using LLM-to-pandas, with rule-based fallback."""
     if not user_question or not user_question.strip():
         return "Please ask a question about your dataset."
@@ -752,7 +871,7 @@ def answer_question(user_question, df):
             
         # COMPLEX MULTI-CONDITION HEURISTIC PIPELINE
         parsed = parse_query(raw_question, df)
-        if len(parsed["filters"]) > 0 or parsed["limit"] is not None:
+        if len(parsed["filters"]) > 0 or parsed["limit"] is not None or parsed["superlative"] is not None:
             for f in parsed["filters"]:
                 if f["column"] is None:
                     f["column"] = _best_numeric_column(df)
@@ -923,10 +1042,11 @@ def answer_question(user_question, df):
             else:
                 suggestion = _closest_column_suggestion(user_question, df)
                 if suggestion:
-                    return f"I could not detect a column name in your question. Did you mean: **{suggestion}**?"
+                    return f"I could not detect a column name in your question. Did you mean: **{suggestion}**?\n\nTip: You can try queries like *'top 3 students based on average marks'* or *'who studied the most but failed?'*"
                 return (
-                    "I could not detect a column name in your question. "
-                    f"Try using one of these columns: {', '.join(map(str, df.columns))}"
+                    "I could not detect a column name in your question.\n\n"
+                    "Tip: Try queries like *'top 3 students based on marks'*. "
+                    f"Or use these matching columns: {', '.join(map(str, df.columns))}"
                 )
 
         series = df[column]
@@ -1019,7 +1139,8 @@ def answer_question(user_question, df):
 
         return (
             "I understand the column, but not the operation yet. "
-            "Try words like average, max, min, median, mode, sum, or count."
+            "Try words like average, max, min, median, mode, sum, or count.\n\n"
+            "Tip: You can also try complex filters, for example: *'top 3 students based on average marks'*"
         )
     except Exception as error:
         return f"Sorry — I couldn't process that query. Details: {error}"
