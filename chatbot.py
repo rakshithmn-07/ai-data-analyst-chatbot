@@ -402,6 +402,27 @@ def _extract_range_query(raw_question, df):
     return col, val_min, val_max
 
 
+def _extract_exact_query(raw_question, df):
+    """
+    Look for exact match queries like 'who scored 74 in english', 'got 85', 'marks is 90'.
+    Returns (column, value) or (None, None).
+    """
+    pattern = r"(who scored|which student scored|who got|scored|got|marks is|marks are|is exactly|equals)\s+(\d+(?:\.\d+)?)"
+    match = re.search(pattern, raw_question, re.IGNORECASE)
+    if not match:
+        return None, None
+        
+    value = float(match.group(2))
+    
+    q_stripped = raw_question.replace(match.group(0), "")
+    col = _find_column_from_question(q_stripped, df)
+    
+    if not col:
+        col = _best_numeric_column(df)
+        
+    return col, value
+
+
 def _get_openai_client():
     """Create OpenAI client from OPENAI_API_KEY environment variable."""
     if OpenAI is None:
@@ -523,60 +544,41 @@ def answer_question(user_question, df):
                 "Here is the correlation analysis for all numeric columns. The chart below visually summarizes the relationships between the variables."
             )
 
-        # Basic filtering (rule-based)
+        # Unified Filtering Engine (Range, Comparison, Exact)
         filter_col, filter_op, filter_val = _extract_filter_query(raw_question, df)
-        if filter_col is not None and filter_op is not None:
-            if not pd.api.types.is_numeric_dtype(df[filter_col]):
-                return f"Column '{filter_col}' is not numeric, so it cannot be filtered numerically."
-                
-            if filter_op == ">":
-                filtered_df = df[df[filter_col] > filter_val]
-                cond_text = f"greater than {filter_val}"
-            else:
-                filtered_df = df[df[filter_col] < filter_val]
-                cond_text = f"less than {filter_val}"
-                
-            if filtered_df.empty:
-                return _format_result_with_explanation(
-                    "No matching records found.",
-                    "Your filter condition did not match any rows in the dataset."
-                )
-                
-            name_col = None
-            for c in df.columns:
-                if str(c).strip().lower() in ["name", "student", "student_name", "user_name"]:
-                    name_col = c
-                    break
-            if not name_col:
-                non_numeric = df.select_dtypes(exclude="number").columns
-                if len(non_numeric) > 0:
-                    name_col = non_numeric[0]
-                    
-            cols_to_show = []
-            if name_col and name_col != filter_col:
-                cols_to_show.append(name_col)
-            cols_to_show.append(filter_col)
-            
-            result_header = f"**Showing rows where {filter_col} {filter_op} {filter_val}**"
-            
-            return _format_result_with_explanation(
-                result_header,
-                f"Found {len(filtered_df)} row(s) matching your condition."
-            ), filtered_df[cols_to_show]
-
-        # Range filtering (rule-based)
         range_col, range_min, range_max = _extract_range_query(raw_question, df)
+        exact_col, exact_val = _extract_exact_query(raw_question, df)
+
+        active_filter_type = None
+        target_col = None
+        
         if range_col is not None and range_min is not None and range_max is not None:
-            if not pd.api.types.is_numeric_dtype(df[range_col]):
-                return f"Column '{range_col}' is not numeric, so it cannot be filtered by range."
+            active_filter_type = "range"
+            target_col = range_col
+        elif filter_col is not None and filter_op is not None:
+            active_filter_type = "comparison"
+            target_col = filter_col
+        elif exact_col is not None and exact_val is not None:
+            active_filter_type = "exact"
+            target_col = exact_col
+
+        if active_filter_type:
+            if not pd.api.types.is_numeric_dtype(df[target_col]):
+                return f"Column '{target_col}' is not numeric, so it cannot be filtered."
                 
-            filtered_df = df[(df[range_col] > range_min) & (df[range_col] < range_max)]
-            
-            if filtered_df.empty:
-                return _format_result_with_explanation(
-                    "No matching records found.",
-                    f"Your filter condition (between {range_min} and {range_max}) did not match any rows in the dataset."
-                )
+            if active_filter_type == "range":
+                filtered_df = df[(df[target_col] >= range_min) & (df[target_col] <= range_max)]
+                desc = f"between {range_min} and {range_max}"
+            elif active_filter_type == "comparison":
+                if filter_op == ">":
+                    filtered_df = df[df[target_col] > filter_val]
+                    desc = f"greater than {filter_val}"
+                else:
+                    filtered_df = df[df[target_col] < filter_val]
+                    desc = f"less than {filter_val}"
+            else: # exact
+                filtered_df = df[df[target_col] == exact_val]
+                desc = f"exactly {exact_val}"
                 
             name_col = None
             for c in df.columns:
@@ -588,13 +590,36 @@ def answer_question(user_question, df):
                 if len(non_numeric) > 0:
                     name_col = non_numeric[0]
                     
+            if filtered_df.empty:
+                return _format_result_with_explanation(
+                    "No student found." if active_filter_type == "exact" else "No matching records found.",
+                    f"No one scored {desc} in {target_col}."
+                )
+
+            # Check if query requests names ("who", "which student")
+            wants_names = any(w in raw_question for w in ["who", "which student", "whose"])
+
+            # Format 1: Exact string sentence (used for 'exact' or explicitly requesting 'who')
+            if active_filter_type == "exact" or wants_names:
+                if name_col:
+                    names = filtered_df[name_col].astype(str).tolist()
+                    name_list = ", ".join(names)
+                    result_text = f"**Students who scored {desc} in {target_col}:** {name_list}"
+                else:
+                    result_text = f"**{len(filtered_df)} records found scoring {desc} in {target_col}** (No name column detected)."
+                
+                return _format_result_with_explanation(
+                    result_text,
+                    "Filtering lookup successfully executed."
+                )
+            
+            # Format 2: Dataframe Table (Default for Range & Comparison without "who")
             cols_to_show = []
-            if name_col and name_col != range_col:
+            if name_col and name_col != target_col:
                 cols_to_show.append(name_col)
-            cols_to_show.append(range_col)
+            cols_to_show.append(target_col)
             
-            result_header = f"**Showing rows where {range_col} is between {range_min} and {range_max}**"
-            
+            result_header = f"**Showing rows where {target_col} is {desc}**"
             return _format_result_with_explanation(
                 result_header,
                 f"Found {len(filtered_df)} row(s) matching your condition."
