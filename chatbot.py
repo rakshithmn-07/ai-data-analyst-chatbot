@@ -523,6 +523,212 @@ def _answer_question_with_llm(user_question, df):
         return f"LLM-based analysis failed: {error}"
 
 
+def parse_query(raw_query, df):
+    """
+    Parses complex natural language queries into logical structures (filters, derived domains, sort & limits).
+    """
+    query_lower = raw_query.lower()
+    parsed = {
+        "filters": [],
+        "sort": None,
+        "limit": None,
+        "derived_columns": set(),
+        "wants_names": any(w in query_lower for w in ["who", "which student", "whose", "students", "name", "list"]),
+        "intent": ""
+    }
+    
+    # 1. Intent Detection
+    if any(w in query_lower for w in ["chart", "plot", "histogram", "graph", "visualize"]):
+        parsed["intent"] = "visualize"
+    elif any(w in query_lower for w in ["top", "highest", "lowest", "best"]):
+        parsed["intent"] = "ranking"
+    elif any(w in query_lower for w in ["average", "mean", "sum", "max", "min"]) and "average marks" not in query_lower:
+        parsed["intent"] = "aggregation"
+    else:
+        parsed["intent"] = "filtering"
+
+    # 2. Extract Top N 
+    top_match = re.search(r"top\s+(\d+)", query_lower)
+    if top_match:
+        parsed["limit"] = int(top_match.group(1))
+
+    def find_col(text):
+        if not text: return None
+        text_clean = text.strip().lower()
+        if "mark" in text_clean: return "average_marks"
+        if "fail" in text_clean: return "average_marks"
+        if "study" in text_clean or "hour" in text_clean: return _find_column_from_question("Study", df)
+        if "math" in text_clean: return _find_column_from_question("Math", df)
+        if "science" in text_clean: return _find_column_from_question("Science", df)
+        if "english" in text_clean: return _find_column_from_question("English", df)
+        return _find_column_from_question(text_clean, df)
+        
+    # 3. Handle derived semantic flags
+    if "marks" in query_lower or "failed" in query_lower:
+        parsed["derived_columns"].add("average_marks")
+        
+    if "failed" in query_lower:
+        parsed["filters"].append({"column": "average_marks", "operator": "<", "threshold_type": "value", "value": 50})
+
+    # 4. Trapping generic dynamic thresholds ("high X" / "low Y")
+    for match in re.finditer(r"(high|low)\s+([a-zA-Z_]+(?:[\s_][a-zA-Z_]+)?)", query_lower):
+        direction, col_hint = match.groups()
+        col = find_col(col_hint)
+        if col:
+            op = ">" if direction == "high" else "<"
+            parsed["filters"].append({"column": col, "operator": op, "threshold_type": "mean", "value": None})
+
+    # 5. Multimatching conditions like "more than X in A and B"
+    pattern = r"(above|below|greater than|less than|more than|over|under)\s+(\d+(?:\.\d+)?)(?:\s+(?:in|for|hours of|hours)?\s*([a-zA-Z_]+))?(?:\s+and\s+([a-zA-Z_]+))?"
+    for match in re.finditer(pattern, query_lower):
+        keyword = match.group(1).strip()
+        op = ">" if keyword in ["above", "greater than", "more than", "over"] else "<"
+        val = float(match.group(2))
+        
+        col1_hint = match.group(3)
+        col2_hint = match.group(4)
+        
+        col1 = find_col(col1_hint) if col1_hint else None
+        if col1:
+            parsed["filters"].append({"column": col1, "operator": op, "threshold_type": "value", "value": val})
+            
+        if col2_hint:
+            col2 = find_col(col2_hint)
+            if col2:
+                parsed["filters"].append({"column": col2, "operator": op, "threshold_type": "value", "value": val})
+
+    # 6. Sorting extraction
+    rank_match = re.search(r"top\s+\d+\s+(?:students\s+)?(?:based on|in|for|with highest|with lowest)\s+([a-zA-Z_]+(?:[\s_][a-zA-Z_]+)?)", query_lower)
+    if rank_match:
+        sort_col = find_col(rank_match.group(1))
+        if sort_col:
+            is_asc = "lowest" in query_lower
+            parsed["sort"] = {"column": sort_col, "ascending": is_asc}
+            
+    # Remove identical duplicate filters if trapped multiple times
+    unique_f = []
+    seen = set()
+    for f in parsed["filters"]:
+        k = (f["column"], f["operator"], f["threshold_type"], f["value"])
+        if k not in seen:
+            seen.add(k)
+            unique_f.append(f)
+    parsed["filters"] = unique_f
+    
+    return parsed
+
+
+def apply_filters(df, parsed):
+    """
+    Executes extracted logic block against the dataset. Calculates aggregations on the fly.
+    """
+    result_df = df.copy()
+    explanations = []
+    
+    if "average_marks" in parsed["derived_columns"]:
+        cols = [c for c in ["Math", "Science", "English"] if c in result_df.columns]
+        if cols:
+            result_df["average_marks"] = result_df[cols].mean(axis=1)
+
+    for f in parsed["filters"]:
+        col = f["column"]
+        if col not in result_df.columns:
+            continue
+            
+        op = f["operator"]
+        ttype = f["threshold_type"]
+        val = f["value"]
+        
+        if ttype == "mean":
+            thresh = result_df[col].mean()
+            if op == ">":
+                result_df = result_df[result_df[col] > thresh]
+                explanations.append(f"above average {col} (> {thresh:.1f})")
+            else:
+                result_df = result_df[result_df[col] < thresh]
+                explanations.append(f"below average {col} (< {thresh:.1f})")
+        else:
+            if op == ">":
+                result_df = result_df[result_df[col] > val]
+                explanations.append(f"{col} > {val}")
+            else:
+                result_df = result_df[result_df[col] < val]
+                explanations.append(f"{col} < {val}")
+                
+    if parsed["sort"]:
+        scol = parsed["sort"]["column"]
+        if scol in result_df.columns:
+            result_df = result_df.sort_values(by=scol, ascending=parsed["sort"]["ascending"])
+            desc_str = "ascending" if parsed["sort"]["ascending"] else "descending"
+            explanations.append(f"sorted by {scol} {desc_str}")
+            
+    if parsed["limit"]:
+        result_df = result_df.head(parsed["limit"])
+        explanations.append(f"limited to top {parsed['limit']}")
+        
+    return result_df, explanations
+
+
+def generate_response(filtered_df, parsed, explanations, df):
+    """
+    Constructs the resulting visual object natively. Checks if names are to be stringified.
+    """
+    if filtered_df.empty:
+        return _format_result_with_explanation(
+            "No matching records found.",
+            "Combined conditions: " + " AND ".join(explanations)
+        )
+        
+    name_col = None
+    for c in df.columns:
+        if str(c).strip().lower() in ["name", "student", "student_name", "user_name"]:
+            name_col = c
+            break
+            
+    if not name_col:
+        non_num = df.select_dtypes(exclude="number").columns
+        if len(non_num) > 0:
+            name_col = non_num[0]
+            
+    if parsed["wants_names"] and name_col and not parsed["limit"]:
+        names = filtered_df[name_col].astype(str).tolist()
+        joined = ", ".join(names)
+        msg = f"**Matching Students:** {joined}" if joined else "No matching students found."
+        return _format_result_with_explanation(
+            msg,
+            "Rules applied: " + " AND ".join(explanations)
+        )
+        
+    cols_to_show = []
+    if name_col:
+        cols_to_show.append(name_col)
+        
+    for f in parsed["filters"]:
+        c = f["column"]
+        if c not in cols_to_show and c in filtered_df.columns:
+            cols_to_show.append(c)
+            
+    if parsed["sort"]:
+        c = parsed["sort"]["column"]
+        if c not in cols_to_show and c in filtered_df.columns:
+            cols_to_show.append(c)
+            
+    if len(cols_to_show) == 1 or len(cols_to_show) == 0:
+        num_cols = df.select_dtypes(include="number").columns[:3].tolist()
+        for x in num_cols:
+            if x not in cols_to_show:
+                cols_to_show.append(x)
+        if "average_marks" in filtered_df.columns and "average_marks" not in cols_to_show:
+            cols_to_show.append("average_marks")
+            
+    header = f"**Found {len(filtered_df)} matching records**"
+    if parsed["limit"]:
+        header = f"**Top {len(filtered_df)} Matching Records**"
+        
+    explanation = "Rules applied: " + " AND ".join(explanations) if explanations else "Raw filtered dataset."
+    return _format_result_with_explanation(header, explanation), filtered_df[cols_to_show]
+
+
 def answer_question(user_question, df):
     """Answer user question using LLM-to-pandas, with rule-based fallback."""
     if not user_question or not user_question.strip():
@@ -543,6 +749,16 @@ def answer_question(user_question, df):
                 "Correlation Analysis Generated",
                 "Here is the correlation analysis for all numeric columns. The chart below visually summarizes the relationships between the variables."
             )
+            
+        # COMPLEX MULTI-CONDITION HEURISTIC PIPELINE
+        parsed = parse_query(raw_question, df)
+        if len(parsed["filters"]) > 0 or parsed["limit"] is not None:
+            for f in parsed["filters"]:
+                if f["column"] is None:
+                    f["column"] = _best_numeric_column(df)
+            
+            filtered_df, explains = apply_filters(df, parsed)
+            return generate_response(filtered_df, parsed, explains, df)
 
         # Unified Filtering Engine (Range, Comparison, Exact)
         filter_col, filter_op, filter_val = _extract_filter_query(raw_question, df)
