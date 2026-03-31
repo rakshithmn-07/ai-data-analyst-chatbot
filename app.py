@@ -1,9 +1,10 @@
 import streamlit as st
 import pandas as pd
 import re
-
+import io
 from chatbot import answer_question
 from data_analysis import clean_dataframe, get_basic_info, get_preview, load_csv
+from report_generator import generate_pdf_report
 from visualization import (
     plot_bar_chart,
     plot_correlation_heatmap,
@@ -259,9 +260,10 @@ def _render_auto_result_chart(question, df, rendered_df=None):
     
     if not numeric_cols:
         st.warning("No numeric data available for visualization")
-        return
+        return None
 
     text = (question or "").lower()
+    fig = None
     
     if "compare" in text or "comparison" in text or " vs " in text:
         y_col = numeric_cols[0]
@@ -269,89 +271,84 @@ def _render_auto_result_chart(question, df, rendered_df=None):
         fig = plot_bar_chart(target_df, x_col, y_col)
         st.pyplot(fig)
         st.caption(f"Comparison chart: {y_col} across {x_col}")
-        return
         
-    if len(cat_cols) > 0 and len(numeric_cols) > 0:
+    elif len(cat_cols) > 0 and len(numeric_cols) > 0:
         x_col = cat_cols[0]
         y_col = numeric_cols[0]
         fig = plot_bar_chart(target_df, x_col, y_col)
         st.pyplot(fig)
         st.caption(f"Auto chart: {y_col} across {x_col}")
-        return
 
-    if len(numeric_cols) == 1:
+    elif len(numeric_cols) == 1:
         hist_col = numeric_cols[0]
         fig = plot_histogram(target_df, hist_col)
         st.pyplot(fig)
         st.caption(f"Auto chart: Histogram of {hist_col}")
-        return
         
-    if len(numeric_cols) == 2:
+    elif len(numeric_cols) == 2:
         x_col = numeric_cols[0]
         y_col = numeric_cols[1]
         fig = plot_scatter_chart(target_df, x_col, y_col)
         st.pyplot(fig)
         st.caption(f"Auto chart: Scatter plot of {y_col} vs {x_col}")
-        return
         
-    if len(numeric_cols) >= 3:
+    elif len(numeric_cols) >= 3:
         fig = plot_correlation_heatmap(target_df)
         st.pyplot(fig)
         st.caption(f"Auto chart: Correlation Heatmap across {len(numeric_cols)} features")
-        return
+        
+    return fig
 
 
 def _render_chart_from_question(question, df):
     """Create and display chart if question contains chart keywords."""
     text = question.lower()
     columns = list(df.columns)
+    fig = None
 
     if "histogram" in text or "hist" in text or "distribution" in text:
         numeric_cols = _meaningful_numeric_columns(df)
         if not numeric_cols:
             st.warning("No numeric columns found for histogram.")
-            return
+            return None
         default_col = _best_numeric_column_for_chart(df, question=question) or _select_default_column(numeric_cols, "value")
         fig = plot_histogram(df, default_col)
         st.pyplot(fig)
         st.caption(f"Histogram column: {default_col}")
-        return
 
-    if "bar" in text or "comparison" in text or "compare" in text:
+    elif "bar" in text or "comparison" in text or "compare" in text:
         if len(columns) < 2:
             st.warning("Need at least two columns for a bar chart.")
-            return
+            return None
         y_candidates = _meaningful_numeric_columns(df) or df.select_dtypes(include="number").columns.tolist()
         if not y_candidates:
             st.warning("No numeric columns found for bar chart.")
-            return
+            return None
         x_guess = _best_x_column_for_comparison(df, question=question) or columns[0]
         y_guess = _best_numeric_column_for_chart(df, question=question) or y_candidates[0]
         fig = plot_bar_chart(df, x_guess, y_guess)
         st.pyplot(fig)
         st.caption(f"Bar chart: X={x_guess}, Y={y_guess}")
-        return
 
-    if "line" in text:
+    elif "line" in text:
         if len(columns) < 2:
             st.warning("Need at least two columns for a line chart.")
-            return
+            return None
         y_candidates = _meaningful_numeric_columns(df) or df.select_dtypes(include="number").columns.tolist()
         if not y_candidates:
             st.warning("No numeric columns found for line chart.")
-            return
+            return None
         x_guess = _best_x_column_for_comparison(df, question=question) or columns[0]
         y_guess = _best_numeric_column_for_chart(df, question=question) or y_candidates[0]
         fig = plot_line_chart(df, x_guess, y_guess)
         st.pyplot(fig)
         st.caption(f"Line chart: X={x_guess}, Y={y_guess}")
-        return
 
-    if "heatmap" in text or "correlation" in text or "relationship" in text:
+    elif "heatmap" in text or "correlation" in text or "relationship" in text:
         numeric_df = df.select_dtypes(include="number")
         if numeric_df.shape[1] < 2:
             st.warning("Need at least two numeric columns for correlation analysis.")
-            return
+            return None
 
         fig = plot_correlation_heatmap(df)
         st.pyplot(fig)
@@ -378,17 +375,17 @@ def _render_chart_from_question(question, df):
         else:
             st.info("No exceptionally strong correlations (> 0.7 or < -0.7) were found among the numeric columns.")
 
-        return
-
-    # Fallback default chart for "plot" or "chart"
-    numeric_cols = _meaningful_numeric_columns(df)
-    if numeric_cols:
-        default_col = _best_numeric_column_for_chart(df, question=question) or numeric_cols[0]
-        fig = plot_histogram(df, default_col)
-        st.pyplot(fig)
-        st.caption(f"Auto-selected chart: histogram of {default_col}")
-    else:
-        st.warning("No numeric columns found for default plotting.")
+    else: # Fallback default chart for "plot" or "chart"
+        numeric_cols = _meaningful_numeric_columns(df)
+        if numeric_cols:
+            default_col = _best_numeric_column_for_chart(df, question=question) or numeric_cols[0]
+            fig = plot_histogram(df, default_col)
+            st.pyplot(fig)
+            st.caption(f"Auto-selected chart: histogram of {default_col}")
+        else:
+            st.warning("No numeric columns found for default plotting.")
+            
+    return fig
 
 
 def _display_automatic_insights(df):
@@ -626,7 +623,6 @@ st.divider()
 if uploaded_file is not None:
     try:
         raw_df = load_csv(uploaded_file)
-
         df = clean_dataframe(
             raw_df,
             missing_strategy=missing_strategy,
@@ -752,11 +748,12 @@ if uploaded_file is not None:
             st.markdown("<br>", unsafe_allow_html=True)
 
             st.subheader("Chart")
+            fig = None
             try:
                 if _wants_chart(user_question):
-                    _render_chart_from_question(user_question, df)
+                    fig = _render_chart_from_question(user_question, df)
                 else:
-                    _render_auto_result_chart(user_question, df, rendered_df=rendered_df)
+                    fig = _render_auto_result_chart(user_question, df, rendered_df=rendered_df)
             except Exception as chart_error:
                 # Try to suggest a likely column if user typed one that doesn't exist
                 suggestions = _suggest_columns_from_text(user_question, df)
@@ -767,7 +764,46 @@ if uploaded_file is not None:
                     )
                 else:
                     st.warning(f"Could not generate chart: {chart_error}")
+            
+            # --- Download Buttons ---
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.subheader("📥 Download Options")
+            
+            # Download CSV
+            csv_data = df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="Download Data as CSV",
+                data=csv_data,
+                file_name="data.csv",
+                mime="text/csv",
+            )
+
+            # Download Chart
+            if fig:
+                img_buffer = io.BytesIO()
+                fig.savefig(img_buffer, format="png", dpi=300)
+                img_buffer.seek(0)
+                st.download_button(
+                    label="Download Chart as PNG",
+                    data=img_buffer,
+                    file_name="chart.png",
+                    mime="image/png",
+                )
+
+            # Download PDF Report
+            if st.button("Generate PDF Report"):
+                with st.spinner("Generating PDF..."):
+                    pdf_path = generate_pdf_report(df, fig, explanation_text or result_text)
+                    with open(pdf_path, "rb") as f:
+                        st.download_button(
+                            label="Download PDF Report",
+                            data=f,
+                            file_name="report.pdf",
+                            mime="application/pdf",
+                        )
+            
             _card_end()
+            
     except Exception as error:
         st.warning(f"Could not process the file. Details: {error}")
 else:
