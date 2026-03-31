@@ -1,5 +1,5 @@
-import pandas as pd
 import streamlit as st
+import pandas as pd
 import re
 
 from chatbot import answer_question
@@ -693,6 +693,10 @@ if uploaded_file is not None:
         _card_end()
         if ask_clicked:
             response = answer_question(user_question, df)
+            rendered_df = None
+            if isinstance(response, tuple):
+                response, rendered_df = response
+                
             result_text, explanation_text = _split_result_and_explanation(response)
             st.markdown("<br>", unsafe_allow_html=True)
             st.divider()
@@ -706,6 +710,11 @@ if uploaded_file is not None:
                 st.warning("No result available for this query.")
             if explanation_text:
                 st.info(explanation_text)
+                
+            if rendered_df is not None:
+                st.markdown("<br><h5>Matching Records</h5>", unsafe_allow_html=True)
+                st.dataframe(rendered_df, use_container_width=True)
+                
             st.markdown("<br>", unsafe_allow_html=True)
 
             st.subheader("Chart")
